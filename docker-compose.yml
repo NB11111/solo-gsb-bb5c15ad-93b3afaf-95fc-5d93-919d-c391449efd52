@@ -6,6 +6,10 @@ services:
       - "8000:8000"
     environment:
       DATABASE_PATH: /data/events.db
+      # 来源签名密钥（JSON）。生产请替换为自己的密钥，也可用 .env 覆盖。
+      # 键名即 X-Webhook-Source；密钥轮换时补 previous + previous_valid_until 宽限期。
+      WEBHOOK_SECRETS_JSON: >-
+        {"demo": {"current": "demo-secret-change-me"}}
     volumes:
       - webhook-data:/data
     restart: unless-stopped

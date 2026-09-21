@@ -1,13 +1,15 @@
 """Webhook 收件箱 API。"""
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from .auth import Signer, WebhookAuthError, load_secrets
 from .db import Database
 from .store import (
     BatchConflictError,
@@ -15,6 +17,7 @@ from .store import (
     EventNotFoundError,
     EventStore,
     InvalidCursorError,
+    NonceReuseError,
     content_hash,
 )
 
@@ -54,9 +57,16 @@ class EventBatchOut(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时自动建表（CREATE TABLE IF NOT EXISTS）
+    # 启动时自动建表（CREATE TABLE IF NOT EXISTS，兼容既有数据库）
     db = Database(os.environ.get("DATABASE_PATH", "events.db"))
+    try:
+        # 密钥配置非法则启动直接失败（fail-fast），避免静默放行
+        secrets = load_secrets(os.environ.get("WEBHOOK_SECRETS_JSON"))
+    except ValueError:
+        db.close()
+        raise
     app.state.store = EventStore(db)
+    app.state.signer = Signer(secrets)
     yield
     db.close()
 
@@ -68,16 +78,63 @@ def get_store(request: Request) -> EventStore:
     return request.app.state.store
 
 
+async def authenticate_webhook(request: Request) -> tuple[str, str, bytes]:
+    """读取原始请求体并校验来源签名。
+
+    签名串基于原始字节体（timestamp + 换行 + nonce + 换行 + body），故必须在
+    JSON 解析之前完成验签。任何头部 / 时间戳 / 来源 / 签名问题均为 401，
+    且此刻尚未触碰数据库，天然零写入。返回 (source, nonce, raw_body)。
+    """
+    body = await request.body()
+    try:
+        source, nonce = request.app.state.signer.verify(request.headers, body)
+    except WebhookAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    return source, nonce, body
+
+
+def read_event(auth: tuple[str, str, bytes] = Depends(authenticate_webhook)) -> EventIn:
+    _, _, body = auth
+    try:
+        data = json.loads(body)
+        return EventIn.model_validate(data)
+    except (ValueError, ValidationError):
+        raise HTTPException(status_code=422, detail="invalid event JSON body")
+
+
+def read_batch(auth: tuple[str, str, bytes] = Depends(authenticate_webhook)) -> EventBatchIn:
+    _, _, body = auth
+    try:
+        data = json.loads(body)
+        return EventBatchIn.model_validate(data)
+    except (ValueError, ValidationError):
+        raise HTTPException(status_code=422, detail="invalid batch JSON body")
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
 
 
 @app.post("/events", response_model=EventOut, status_code=201)
-def create_event(event: EventIn, response: Response, store: EventStore = Depends(get_store)):
-    """提交事件。重复提交（内容相同）返回 200 与首个版本；内容不同返回 409。"""
+def create_event(
+    response: Response,
+    auth: tuple[str, str, bytes] = Depends(authenticate_webhook),
+    event: EventIn = Depends(read_event),
+    store: EventStore = Depends(get_store),
+):
+    """提交事件。重复提交（内容相同）返回 200 与首个版本；内容不同返回 409。
+
+    需携带来源签名头；nonce 登记与事件插入在同一 SQLite 写事务内，
+    重放（nonce 已用）返回 401 且零写入。
+    """
+    source, nonce, _ = auth
     try:
-        record, created = store.create_event(event.event_id, event.type, event.payload)
+        record, created = store.create_event(
+            event.event_id, event.type, event.payload, source=source, nonce=nonce
+        )
+    except NonceReuseError:
+        raise HTTPException(status_code=401, detail="nonce already used")
     except EventConflictError as exc:
         raise HTTPException(
             status_code=409,
@@ -89,15 +146,20 @@ def create_event(event: EventIn, response: Response, store: EventStore = Depends
 
 @app.post("/events/batch", response_model=EventBatchOut, status_code=201)
 def create_events_batch(
-    batch: EventBatchIn, response: Response, store: EventStore = Depends(get_store)
+    response: Response,
+    auth: tuple[str, str, bytes] = Depends(authenticate_webhook),
+    batch: EventBatchIn = Depends(read_batch),
+    store: EventStore = Depends(get_store),
 ):
     """批量提交事件（1~100 个），整批原子写入。
 
     批内同 event_id 且内容语义相同视为重复，映射到同一结果；同 ID 内容不同
     返回 422 并标出冲突下标。与库中记录内容冲突返回 409 及对应下标，且整批
     零写入。无冲突时单事务写入全部新事件，按原输入顺序返回记录与 created
-    标记；全部已存在时返回 200，否则 201。
+    标记；全部已存在时返回 200，否则 201。nonce 与整批事件在同一事务内
+    登记，重放返回 401 且零写入。
     """
+    source, nonce, _ = auth
     # 批内按 event_id 归并：分组 + 语义级内容比对（与单条接口同一套指纹）
     groups: dict[str, list[int]] = {}
     for idx, event in enumerate(batch.events):
@@ -127,7 +189,9 @@ def create_events_batch(
         )
 
     try:
-        results = store.create_events_batch(unique_items)
+        results = store.create_events_batch(unique_items, source=source, nonce=nonce)
+    except NonceReuseError:
+        raise HTTPException(status_code=401, detail="nonce already used")
     except BatchConflictError as exc:
         raise HTTPException(
             status_code=409,

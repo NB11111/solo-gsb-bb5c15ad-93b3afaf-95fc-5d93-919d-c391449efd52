@@ -4,13 +4,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from datetime import datetime, timezone
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .auth import SKEW_SECONDS
 from .db import Database
 
 STATUS_PENDING = "pending"
 STATUS_ACKED = "acked"
+
+# nonce 在库中的保留时长 = 2 倍时钟偏移窗口：最晚被接受的时间戳
+# （服务器时间 + 300s）在之后重放时，原 nonce 必定仍未过期。
+NONCE_RETENTION_SECONDS = SKEW_SECONDS * 2
 
 
 class EventConflictError(Exception):
@@ -29,6 +35,15 @@ class BatchConflictError(Exception):
         self.event_ids = event_ids
 
 
+class NonceReuseError(Exception):
+    """同来源的 nonce 已在有效窗口内消费过（重放）。"""
+
+    def __init__(self, source: str, nonce: str) -> None:
+        super().__init__(f"nonce {nonce!r} already used by source {source!r}")
+        self.source = source
+        self.nonce = nonce
+
+
 class EventNotFoundError(Exception):
     pass
 
@@ -40,7 +55,11 @@ class InvalidCursorError(Exception):
 def utcnow_iso() -> str:
     """固定 6 位小数的 UTC ISO-8601 字符串，保证字典序 == 时间序。"""
     now = datetime.now(timezone.utc)
-    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond:06d}Z"
+    return iso_utc(now)
+
+
+def iso_utc(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond:06d}Z"
 
 
 def canonical_json(value: Any) -> str:
@@ -80,39 +99,72 @@ class EventStore:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def create_event(self, event_id: str, type_: str, payload: Any) -> tuple[dict, bool]:
-        """幂等写入。
+    def _register_nonce(self, conn: sqlite3.Connection, source: str, nonce: str) -> None:
+        """在当前事务内登记 nonce。
 
-        返回 (事件记录, 是否新建)。并发下由 INSERT OR IGNORE 保证只有首个
-        版本落库；重复提交返回库中已存的首个版本；内容不同则抛冲突。
+        先顺手清除已过保留期的 nonce，再做唯一插入。(source, nonce) 主键
+        冲突即重放，由调用方（同一写事务内）随事件一起回滚，保证并发
+        重放中只有一个请求提交成功。
+        """
+        now = datetime.now(timezone.utc)
+        seen_at = iso_utc(now)
+        expires_at = iso_utc(now + timedelta(seconds=NONCE_RETENTION_SECONDS))
+        conn.execute("DELETE FROM used_nonces WHERE expires_at <= ?", (seen_at,))
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO used_nonces (source, nonce, seen_at, expires_at) VALUES (?, ?, ?, ?)",
+            (source, nonce, seen_at, expires_at),
+        )
+        if cur.rowcount != 1:
+            raise NonceReuseError(source, nonce)
+
+    def create_event(
+        self, event_id: str, type_: str, payload: Any, *, source: str, nonce: str
+    ) -> tuple[dict, bool]:
+        """幂等写入，且 nonce 登记与事件插入处于同一写事务。
+
+        返回 (事件记录, 是否新建)。并发下由 BEGIN IMMEDIATE + 单写连接保证
+        nonce 登记与首个事件版本一起原子落库；重复 nonce（重放）抛
+        NonceReuseError 且零写入；重复事件返回库中已存的首个版本；内容
+        不同则抛冲突，nonce 一并回滚。
         """
         digest = content_hash(type_, payload)
-        created_at = utcnow_iso()
         with self.db.lock:
-            cur = self.db.conn.execute(
-                """
-                INSERT OR IGNORE INTO events
-                    (event_id, type, payload, content_hash, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (event_id, type_, canonical_json(payload), digest, STATUS_PENDING, created_at),
-            )
-            created = cur.rowcount == 1
-            row = self.db.conn.execute(
-                "SELECT * FROM events WHERE event_id = ?", (event_id,)
-            ).fetchone()
-        if not created and row["content_hash"] != digest:
-            raise EventConflictError(event_id)
-        return _row_to_event(row), created
+            self.db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._register_nonce(self.db.conn, source, nonce)
+                existed_row = self.db.conn.execute(
+                    "SELECT content_hash FROM events WHERE event_id = ?", (event_id,)
+                ).fetchone()
+                if existed_row is not None and existed_row["content_hash"] != digest:
+                    raise EventConflictError(event_id)
+                self.db.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO events
+                        (event_id, type, payload, content_hash, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (event_id, type_, canonical_json(payload), digest, STATUS_PENDING, utcnow_iso()),
+                )
+                row = self.db.conn.execute(
+                    "SELECT * FROM events WHERE event_id = ?", (event_id,)
+                ).fetchone()
+                self.db.conn.execute("COMMIT")
+            except Exception:
+                if self.db.conn.in_transaction:
+                    self.db.conn.execute("ROLLBACK")
+                raise
+        return _row_to_event(row), existed_row is None
 
-    def create_events_batch(self, items: list[tuple[str, str, Any]]) -> list[tuple[dict, bool]]:
-        """批量幂等写入：冲突检查与全部插入在单一事务内完成。
+    def create_events_batch(
+        self, items: list[tuple[str, str, Any]], *, source: str, nonce: str
+    ) -> list[tuple[dict, bool]]:
+        """批量幂等写入：nonce 登记、冲突检查与全部插入在单一事务内完成。
 
         items 需已按 event_id 去重（批内归并在 API 层完成）。任一 event_id
         与库中记录内容冲突则整批零写入并抛 BatchConflictError；否则返回与
         items 顺序对齐的 (事件记录, 是否新建) 列表。连接级锁 + BEGIN IMMEDIATE
-        使并发批次彼此串行：要么整批提交，要么整批回滚，不产生部分提交，
-        也不会覆盖首个版本。
+        使并发批次彼此串行：要么 nonce 与整批事件一起提交，要么一起回滚，
+        并发重放仅一次成功，也不会覆盖首个版本。
         """
         if not items:
             return []
@@ -125,6 +177,7 @@ class EventStore:
         with self.db.lock:
             self.db.conn.execute("BEGIN IMMEDIATE")
             try:
+                self._register_nonce(self.db.conn, source, nonce)
                 rows = self.db.conn.execute(
                     f"SELECT * FROM events WHERE event_id IN ({placeholders})", ids
                 ).fetchall()
@@ -136,6 +189,7 @@ class EventStore:
                 ]
                 if conflicts:
                     raise BatchConflictError(conflicts)
+                created_ids: set[str] = set()
                 for event_id, type_, payload, digest in prepared:
                     if event_id in existing:
                         continue
@@ -154,6 +208,7 @@ class EventStore:
                             utcnow_iso(),
                         ),
                     )
+                    created_ids.add(event_id)
                 rows = self.db.conn.execute(
                     f"SELECT * FROM events WHERE event_id IN ({placeholders})", ids
                 ).fetchall()
@@ -164,7 +219,7 @@ class EventStore:
                 raise
         by_id = {row["event_id"]: row for row in rows}
         return [
-            (_row_to_event(by_id[event_id]), event_id not in existing)
+            (_row_to_event(by_id[event_id]), event_id in created_ids)
             for event_id, _, _, _ in prepared
         ]
 

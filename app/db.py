@@ -18,6 +18,18 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events (created_at, event_id);
 CREATE INDEX IF NOT EXISTS idx_events_status ON events (status);
+
+-- 已消费的 webhook nonce（重放防护）。PRIMARY KEY(source, nonce) 使同来源
+-- nonce 在数据库层就不可能登记两次；与事件插入在同一写事务内提交，
+-- 因此并发重放中只有一个请求随事件一起登记成功。
+CREATE TABLE IF NOT EXISTS used_nonces (
+    source     TEXT NOT NULL,
+    nonce      TEXT NOT NULL,
+    seen_at    TEXT NOT NULL,                -- 固定 6 位小数的 UTC ISO-8601
+    expires_at TEXT NOT NULL,                -- 登记时间 + 2 倍时钟偏移窗口
+    PRIMARY KEY (source, nonce)
+);
+CREATE INDEX IF NOT EXISTS idx_used_nonces_expires_at ON used_nonces (expires_at);
 """
 
 
