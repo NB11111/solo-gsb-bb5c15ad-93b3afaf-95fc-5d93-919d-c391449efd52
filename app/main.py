@@ -1,13 +1,21 @@
 """Webhook 收件箱 API。"""
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, ValidationError
 
+from .auth import (
+    NONCE_MAX_LENGTH,
+    WebhookAuthError,
+    WebhookAuthenticator,
+)
 from .db import Database
 from .store import (
     BatchConflictError,
@@ -15,6 +23,7 @@ from .store import (
     EventNotFoundError,
     EventStore,
     InvalidCursorError,
+    ReplayError,
     content_hash,
 )
 
@@ -52,20 +61,125 @@ class EventBatchOut(BaseModel):
     items: list[BatchItemOut]
 
 
+@dataclass(frozen=True)
+class AuthenticatedRequest:
+    """验签通过后的请求上下文。"""
+
+    source: str
+    nonce: str
+    body: bytes
+
+
+# 供 openapi_extra 使用：把四个签名头登记到 Swagger 文档
+_SIGNATURE_HEADER_PARAMS = [
+    {
+        "name": "X-Webhook-Source",
+        "in": "header",
+        "required": True,
+        "schema": {"type": "string"},
+        "description": "来源标识，对应 WEBHOOK_SECRETS_JSON 中的键",
+    },
+    {
+        "name": "X-Webhook-Timestamp",
+        "in": "header",
+        "required": True,
+        "schema": {"type": "integer"},
+        "description": "Unix 秒；与服务器时间偏离超过 300 秒即拒绝",
+    },
+    {
+        "name": "X-Webhook-Nonce",
+        "in": "header",
+        "required": True,
+        "schema": {"type": "string", "maxLength": 128},
+        "description": "来源内唯一的一次性随机串，重放同一 nonce 返回 401",
+    },
+    {
+        "name": "X-Webhook-Signature",
+        "in": "header",
+        "required": True,
+        "schema": {"type": "string"},
+        "description": "HMAC-SHA256(timestamp + \\n + nonce + \\n + 原始请求体) 的十六进制摘要",
+    },
+]
+
+
+def _ingestion_openapi(model: type[BaseModel]) -> dict:
+    return {
+        "parameters": _SIGNATURE_HEADER_PARAMS,
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": model.model_json_schema(ref_template="#/components/schemas/{model}")
+                }
+            },
+        },
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时自动建表（CREATE TABLE IF NOT EXISTS）
+    # 启动时自动建表（CREATE TABLE IF NOT EXISTS，旧库增量补建 used_nonces）
     db = Database(os.environ.get("DATABASE_PATH", "events.db"))
+    # WEBHOOK_SECRETS_JSON 配置非法时快速失败，避免以“全部 401”的状态静默运行
+    app.state.authenticator = WebhookAuthenticator.from_env()
     app.state.store = EventStore(db)
     yield
     db.close()
 
 
-app = FastAPI(title="Webhook Inbox", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Webhook Inbox", version="1.1.0", lifespan=lifespan)
 
 
 def get_store(request: Request) -> EventStore:
     return request.app.state.store
+
+
+async def require_signature(request: Request) -> AuthenticatedRequest:
+    """校验 X-Webhook-Source / Timestamp / Nonce / Signature 四个请求头。
+
+    必须在路由内手动解析 JSON：FastAPI 对模型参数的体校验先于依赖求解，
+    若声明 pydantic 模型参数，畸形体会先返回 422，绕过签名校验（且签名
+    必须覆盖未经解析的原始字节）。任一条件不满足统一 401，且此时尚未
+    触碰数据库，天然零写入。
+    """
+    source = request.headers.get("x-webhook-source", "")
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+    nonce = request.headers.get("x-webhook-nonce", "")
+    signature = request.headers.get("x-webhook-signature", "")
+    body = await request.body()
+
+    missing = not source or not timestamp or not nonce or not signature
+    if missing or len(nonce) > NONCE_MAX_LENGTH:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    authenticator: WebhookAuthenticator = request.app.state.authenticator
+    try:
+        authenticator.verify(source, timestamp, nonce, signature, body)
+    except WebhookAuthError:
+        raise HTTPException(status_code=401, detail="unauthorized") from None
+    return AuthenticatedRequest(source=source, nonce=nonce, body=body)
+
+
+def _parse_json_body(body: bytes, model: type[BaseModel]) -> BaseModel:
+    """验签通过后再解析请求体；任何解析/校验错误仍以标准 422 返回。"""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise RequestValidationError(
+            [
+                {
+                    "type": "json_invalid",
+                    "loc": ("body",),
+                    "msg": "JSON decode error",
+                    "input": body[:200].decode("utf-8", errors="replace"),
+                }
+            ]
+        )
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors()) from None
 
 
 @app.get("/healthz")
@@ -73,23 +187,46 @@ def healthz() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/events", response_model=EventOut, status_code=201)
-def create_event(event: EventIn, response: Response, store: EventStore = Depends(get_store)):
+@app.post(
+    "/events",
+    response_model=EventOut,
+    status_code=201,
+    # 体在路由内手动解析（鉴权必须先于体校验），这里手动把请求体模型补进 OpenAPI
+    openapi_extra=_ingestion_openapi(EventIn),
+)
+def create_event(
+    response: Response,
+    auth: AuthenticatedRequest = Depends(require_signature),
+    store: EventStore = Depends(get_store),
+):
     """提交事件。重复提交（内容相同）返回 200 与首个版本；内容不同返回 409。"""
+    event = _parse_json_body(auth.body, EventIn)
+    assert isinstance(event, EventIn)
     try:
-        record, created = store.create_event(event.event_id, event.type, event.payload)
+        record, created = store.create_event(
+            event.event_id, event.type, event.payload, source=auth.source, nonce=auth.nonce
+        )
     except EventConflictError as exc:
         raise HTTPException(
             status_code=409,
             detail=f"event_id '{exc.event_id}' already exists with different content",
         )
+    except ReplayError:
+        raise HTTPException(status_code=401, detail="unauthorized") from None
     response.status_code = 201 if created else 200
     return record
 
 
-@app.post("/events/batch", response_model=EventBatchOut, status_code=201)
+@app.post(
+    "/events/batch",
+    response_model=EventBatchOut,
+    status_code=201,
+    openapi_extra=_ingestion_openapi(EventBatchIn),
+)
 def create_events_batch(
-    batch: EventBatchIn, response: Response, store: EventStore = Depends(get_store)
+    response: Response,
+    auth: AuthenticatedRequest = Depends(require_signature),
+    store: EventStore = Depends(get_store),
 ):
     """批量提交事件（1~100 个），整批原子写入。
 
@@ -98,6 +235,9 @@ def create_events_batch(
     零写入。无冲突时单事务写入全部新事件，按原输入顺序返回记录与 created
     标记；全部已存在时返回 200，否则 201。
     """
+    batch = _parse_json_body(auth.body, EventBatchIn)
+    assert isinstance(batch, EventBatchIn)
+
     # 批内按 event_id 归并：分组 + 语义级内容比对（与单条接口同一套指纹）
     groups: dict[str, list[int]] = {}
     for idx, event in enumerate(batch.events):
@@ -127,7 +267,9 @@ def create_events_batch(
         )
 
     try:
-        results = store.create_events_batch(unique_items)
+        results = store.create_events_batch(
+            unique_items, source=auth.source, nonce=auth.nonce
+        )
     except BatchConflictError as exc:
         raise HTTPException(
             status_code=409,
@@ -139,6 +281,8 @@ def create_events_batch(
                 ],
             },
         )
+    except ReplayError:
+        raise HTTPException(status_code=401, detail="unauthorized") from None
 
     items = []
     any_created = False
