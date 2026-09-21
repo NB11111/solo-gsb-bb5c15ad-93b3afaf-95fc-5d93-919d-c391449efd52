@@ -1,0 +1,14 @@
+services:
+  webhook-inbox:
+    build: .
+    image: webhook-inbox:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/events.db
+    volumes:
+      - webhook-data:/data
+    restart: unless-stopped
+
+volumes:
+  webhook-data:
